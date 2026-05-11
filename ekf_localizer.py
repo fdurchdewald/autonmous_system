@@ -79,22 +79,26 @@ class EKFLocalizer(Node):
 
         # Parameter ─────────────────────────────────────────────────────────
         self.declare_parameter('map_yaml',  '')
-        self.declare_parameter('n_beams',   12)
-        self.declare_parameter('sigma_qd',  0.08)
-        self.declare_parameter('sigma_qth', 0.05)
-        self.declare_parameter('sigma_r',   0.15)
-        self.declare_parameter('eps_h',     0.10)
-        self.declare_parameter('gate',      0.50)
-        self.declare_parameter('max_range', 3.50)
+        self.declare_parameter('n_beams',      10)
+        self.declare_parameter('sigma_qd',     0.0238)
+        self.declare_parameter('sigma_qth',    0.0893)
+        self.declare_parameter('sigma_r',      0.0886)
+        self.declare_parameter('eps_h',        0.0350)
+        self.declare_parameter('gate',         0.1571)
+        self.declare_parameter('max_range',    3.50)
+        self.declare_parameter('sigma_p0_xy',  0.05)
+        self.declare_parameter('sigma_p0_yaw', 0.05)
 
-        map_yaml       = self.get_parameter('map_yaml').value
-        self.n_beams   = int(self.get_parameter('n_beams').value)
-        self.sigma_qd  = float(self.get_parameter('sigma_qd').value)
-        self.sigma_qth = float(self.get_parameter('sigma_qth').value)
-        self.sigma_r   = float(self.get_parameter('sigma_r').value)
-        self.eps_h     = float(self.get_parameter('eps_h').value)
-        self.gate      = float(self.get_parameter('gate').value)
-        self.max_range = float(self.get_parameter('max_range').value)
+        map_yaml            = self.get_parameter('map_yaml').value
+        self.n_beams        = int(self.get_parameter('n_beams').value)
+        self.sigma_qd       = float(self.get_parameter('sigma_qd').value)
+        self.sigma_qth      = float(self.get_parameter('sigma_qth').value)
+        self.sigma_r        = float(self.get_parameter('sigma_r').value)
+        self.eps_h          = float(self.get_parameter('eps_h').value)
+        self.gate           = float(self.get_parameter('gate').value)
+        self.max_range      = float(self.get_parameter('max_range').value)
+        self.sigma_p0_xy    = float(self.get_parameter('sigma_p0_xy').value)
+        self.sigma_p0_yaw   = float(self.get_parameter('sigma_p0_yaw').value)
 
         if not map_yaml:
             raise RuntimeError('Parameter map_yaml muss gesetzt sein!')
@@ -266,21 +270,17 @@ class EKFLocalizer(Node):
             self.prev_odom = cur
             return
 
-        th_new = float(np.arctan2(np.sin(self.x_ekf[2] + dth),
-                                  np.cos(self.x_ekf[2] + dth)))
-        self.x_ekf[0] += dist * np.cos(th_new)
-        self.x_ekf[1] += dist * np.sin(th_new)
-        self.x_ekf[2]  = th_new
+        # Exakt wie im Simulator: erst Translation mit ALTEM theta, dann Rotation
+        th = self.x_ekf[2]
+        self.x_ekf[0] += dist * np.cos(th)
+        self.x_ekf[1] += dist * np.sin(th)
+        self.x_ekf[2]  = float(np.arctan2(np.sin(th + dth), np.cos(th + dth)))
 
-        F  = np.array([[1.0, 0.0, -dist * np.sin(th_new)],
-                       [0.0, 1.0,  dist * np.cos(th_new)],
-                       [0.0, 0.0,  1.0]])
-        G  = np.array([[np.cos(th_new), -dist * np.sin(th_new)],
-                       [np.sin(th_new),  dist * np.cos(th_new)],
-                       [0.0,             1.0]])
-        Qu = np.diag([self.sigma_qd**2  * abs(dist),
-                      self.sigma_qth**2 * abs(dth)])
-        self.P = F @ self.P @ F.T + G @ Qu @ G.T
+        F = np.array([[1.0, 0.0, -dist * np.sin(th)],
+                      [0.0, 1.0,  dist * np.cos(th)],
+                      [0.0, 0.0,  1.0]])
+        Q = np.diag([self.sigma_qd**2, self.sigma_qd**2, self.sigma_qth**2])
+        self.P = F @ self.P @ F.T + Q
 
         self.prev_odom = cur
 
@@ -306,18 +306,12 @@ class EKFLocalizer(Node):
 
         t0 = time.time()
 
-        # EKF Update ─────────────────────────────────────────────────────────
-        # Adaptive gate und clamp: bei grosser Unsicherheit (P gross) grosszuegiger,
-        # bei kleiner Unsicherheit (P klein) konservativer.
-        pos_std   = float(np.sqrt(np.trace(self.P[:2, :2])))  # aktuelle Positionsunsicherheit
-        gate_eff  = self.gate + 2.0 * pos_std                 # gate waechst mit Unsicherheit
-        max_corr  = float(np.clip(2.0 * pos_std, 0.15, 1.0))  # max Korrektur pro Scan
-
+        # EKF Update — exakt wie im Simulator (fester gate, fester clamp)
         z_hat = self._expected_scan(self.x_ekf)
         innov = z_obs - z_hat
-        valid = ((z_obs  < self.max_range - 1e-3) &
-                 (z_hat  < self.max_range - 1e-3) &
-                 (np.abs(innov) < gate_eff))
+        valid = ((z_obs < self.max_range - 1e-3) &
+                 (z_hat < self.max_range - 1e-3) &
+                 (np.abs(innov) < self.gate))
 
         if valid.sum() >= 3:
             H_v = self._compute_H(self.x_ekf)[valid]
@@ -330,12 +324,14 @@ class EKFLocalizer(Node):
                 pass
             else:
                 corr     = K @ i_v
-                corr[:2] = np.clip(corr[:2], -max_corr, max_corr)
-                corr[2]  = np.clip(corr[2],  -0.5,      0.5)
+                corr[:2] = np.clip(corr[:2], -0.3, 0.3)
+                corr[2]  = np.clip(corr[2],  -0.3, 0.3)
                 self.x_ekf    = self.x_ekf + corr
                 self.x_ekf[2] = float(np.arctan2(np.sin(self.x_ekf[2]),
                                                   np.cos(self.x_ekf[2])))
                 self.P = (np.eye(3) - K @ H_v) @ self.P
+
+        pos_std = float(np.sqrt(np.trace(self.P[:2, :2])))
 
         dt = (time.time() - t0) * 1000
         self._scan_count += 1
@@ -349,7 +345,6 @@ class EKFLocalizer(Node):
             self.get_logger().info(
                 f'#{self._scan_count:4d} | '
                 f'beams={valid.sum():2d}/{self.n_beams} | '
-                f'gate={gate_eff:.2f}m | '
                 f'dt={dt:.0f}ms | '
                 f'lag={ts_lag*1000:+.0f}ms | '
                 f'pos_std={pos_std:.3f}m | '
@@ -357,10 +352,10 @@ class EKFLocalizer(Node):
                 f'yaw={np.degrees(self.x_ekf[2]):.1f}deg'
             )
 
-        if valid.sum() < 2:
+        if valid.sum() < 3:
             self.get_logger().warn(
                 f'#{self._scan_count} KEIN UPDATE: nur {valid.sum()}/{self.n_beams} '
-                f'Beams gueltig (gate={gate_eff:.2f}m, pos_std={pos_std:.3f}m, '
+                f'Beams gueltig (gate={self.gate:.3f}m, pos_std={pos_std:.3f}m, '
                 f'lag={ts_lag*1000:+.0f}ms)')
 
         if abs(ts_lag) > 0.5:
@@ -376,7 +371,8 @@ class EKFLocalizer(Node):
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
         yaw  = quat_to_yaw(q.x, q.y, q.z, q.w)
         self.x_ekf       = np.array([p.x, p.y, yaw])
-        self.P           = np.diag([0.05**2, 0.05**2, 0.03**2])  # engere Init-Unsicherheit
+        self.P           = np.diag([self.sigma_p0_xy**2, self.sigma_p0_xy**2,
+                                    self.sigma_p0_yaw**2])
         self.initialized = True
         self.get_logger().info(
             f'Startpose gesetzt:  x={p.x:.3f}  y={p.y:.3f}  '
